@@ -110,7 +110,7 @@ p_pca <- ggplot(pca, aes(x = PC1, y = PC2, color = exercise, shape = lesion)) +
 
 p_pca
 
-dir.create("results/figures", showWarnings = FALSE)
+dir.create("../results/figures", showWarnings = FALSE)
 ggsave(
   filename = "../results/figures/poster_PCA_plot.png",
   plot     = p_pca,
