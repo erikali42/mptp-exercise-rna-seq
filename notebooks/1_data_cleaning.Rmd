@@ -1,0 +1,111 @@
+---
+title: "1. Data Cleaning -- Exercise-Induced Transcriptomic Remodeling in an MPTP Mouse Model of Parkinson’s Disease"
+author: "Erika Li"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+1. Setup & Libraries
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+```{r library loading}
+library(readr)
+library(dplyr)
+library(tibble)
+library(purrr)
+library(AnnotationDbi)
+library(org.Mm.eg.db)
+```
+
+```{r helper function to process raw csvs}
+process_file <- function(filepath, sample_name) {
+  df <- read.delim(filepath, header = FALSE)
+  colnames(df) <- c("gene_id", "gene_name", sample_name)
+  return(df)
+}
+```
+
+```{r load in raw csv data}
+sample_files <- tibble(
+  sample = c(
+    "MC1_1", "MC1_2", "MC1_3", "MC1_4",
+    "MC2_1", "MC2_2", "MC2_3",
+    "MC3_1", "MC3_2", "MC3_3",
+    "MC4_1", "MC4_2"
+  ),
+  filepath = file.path(
+    "../raw_data/counts",
+    c(
+      "MC1-1.csv", "MC1-2.csv", "MC1-3.csv", "MC1-4.csv",
+      "MC2-1.csv", "MC2-2.csv", "MC2-3.csv",
+      "MC3-1.csv", "MC3-2.csv", "MC3-3.csv",
+      "MC4-1.csv", "MC4-2.csv"
+    )
+  )
+)
+count_list <- purrr::map2(
+  sample_files$filepath,
+  sample_files$sample,
+  process_file
+)
+```
+
+```{r create clean counts df}
+counts_df <- purrr::reduce(
+  count_list,
+  full_join,
+  by = c("gene_id", "gene_name")
+)
+counts_df[is.na(counts_df)] <- 0
+
+dir.create("clean_data", showWarnings = FALSE)
+saveRDS(counts_df, "../clean_data/cleaned_counts.RDS")
+```
+
+```{r create clean counts matrix}
+count_mat <- counts_df %>%
+  column_to_rownames("gene_id") %>%
+  dplyr::select(-gene_name) %>%
+  as.matrix()
+
+storage.mode(count_mat) <- "integer"
+saveRDS(count_mat, "../clean_data/cleaned_counts_matrix.RDS")
+```
+
+```{r clean metadata}
+metadata <- read_csv("../raw_data/metadata.csv")
+
+metadata <- metadata %>%
+  mutate(
+    lesion   = factor(lesion, levels = c("control", "MPTP")),
+    exercise = factor(exercise, levels = c("no_exercise", "exercise")),
+    group    = paste(lesion, exercise, sep = "_")
+  )
+
+metadata <- metadata %>%
+  filter(sample %in% colnames(count_mat)) %>%
+  arrange(match(sample, colnames(count_mat)))
+
+rownames(metadata) <- metadata$sample
+saveRDS(metadata, "../clean_data/cleaned_metadata.RDS")
+```
+
+```{r create gene map}
+gene_map <- AnnotationDbi::select(
+  org.Mm.eg.db,
+  keys = rownames(count_mat),
+  keytype = "ENSEMBL",
+  columns = c("SYMBOL")
+) %>% distinct(ENSEMBL, .keep_all = TRUE)
+saveRDS(gene_map, "../clean_data/gene_map.RDS")
+```

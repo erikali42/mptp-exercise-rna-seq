@@ -1,0 +1,1109 @@
+---
+title: "2. Analysis -- Exercise-Induced Transcriptomic Remodeling in an MPTP Mouse Model of Parkinson's Disease"
+author: "Erika Li"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+# Setup
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+```{r libraries}
+library(DESeq2)
+library(tidyverse)
+library(pheatmap)
+library(EnhancedVolcano)
+library(fgsea)
+library(GSVA)
+library(msigdbr)
+library(ComplexHeatmap)
+library(cowplot)
+library(ashr)
+library(ggrepel)
+library(circlize)
+library(org.Mm.eg.db)
+library(DGEobj.utils)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggpubr)
+library(biomaRt)
+library(broom)
+library(clusterProfiler)
+library(enrichplot)
+library(AnnotationDbi)
+library(stringr)
+```
+
+```{r load-data}
+count_mat  <- readRDS("../clean_data/cleaned_counts_matrix.RDS")
+counts_df  <- readRDS("../clean_data/cleaned_counts.RDS")
+metadata   <- readRDS("../clean_data/cleaned_metadata.RDS")
+```
+
+---
+
+# DESeq2
+
+```{r deseq2-object}
+dds <- DESeqDataSetFromMatrix(
+  countData = count_mat,
+  colData   = metadata,
+  design    = ~ group
+)
+dds <- dds[rowSums(counts(dds)) > 10, ]
+dds <- DESeq(dds)
+
+dir.create("results", showWarnings = FALSE)
+saveRDS(dds, "../results/dds_full_dataset.rds")
+```
+
+---
+
+# Quality Control
+
+## PCA
+
+```{r pca, message=FALSE}
+vsd <- vst(dds, blind = TRUE)
+saveRDS(vsd, "../results/vsd_full_dataset.rds")
+
+pca        <- plotPCA(vsd, intgroup = c("lesion", "exercise"), returnData = TRUE)
+percentVar <- round(100 * attr(pca, "percentVar"))
+
+p_pca <- ggplot(pca, aes(x = PC1, y = PC2, color = exercise, shape = lesion)) +
+  geom_point(size = 6, alpha = 0.95) +
+  scale_color_manual(
+    values = c("no_exercise" = "#D55E00", "exercise" = "#0072B2"),
+    labels = c("no_exercise" = "No Exercise", "exercise" = "Exercise")
+  ) +
+  scale_shape_manual(
+    values = c("control" = 16, "MPTP" = 17),
+    labels = c("control" = "Saline", "MPTP" = "MPTP")
+  ) +
+  labs(
+    x     = paste0("PC1 (", percentVar[1], "%)"),
+    y     = paste0("PC2 (", percentVar[2], "%)"),
+    color = "Exercise",
+    shape = "Lesion"
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    legend.position  = "right",
+    legend.title     = element_text(face = "bold"),
+    axis.title       = element_text(face = "bold"),
+    axis.text        = element_text(color = "black"),
+    axis.line        = element_line(linewidth = 0.8),
+    panel.border     = element_rect(color = "black", fill = NA, linewidth = 0.8)
+  )
+
+p_pca
+
+dir.create("results/figures", showWarnings = FALSE)
+ggsave(
+  filename = "../results/figures/poster_PCA_plot.png",
+  plot     = p_pca,
+  width    = 7, height = 5, units = "in", dpi = 300
+)
+```
+
+## Sample-to-Sample Distance Heatmap
+
+```{r distance-heatmap, message=FALSE}
+sample_dists   <- dist(t(assay(vsd)))
+sample_dist_mat <- as.matrix(sample_dists)
+colnames(sample_dist_mat) <- gsub("_", "-", colnames(sample_dist_mat))
+rownames(sample_dist_mat) <- gsub("_", "-", rownames(sample_dist_mat))
+
+annotation_col <- metadata[, c("lesion", "exercise")]
+rownames(annotation_col) <- metadata$sample
+annotation_col$exercise <- factor(
+  annotation_col$exercise,
+  levels = c("no_exercise", "exercise"),
+  labels = c("No exercise", "Exercise")
+)
+annotation_col$lesion <- factor(
+  annotation_col$lesion,
+  levels = c("control", "MPTP"),
+  labels = c("Control", "MPTP")
+)
+colnames(annotation_col) <- c("Lesion", "Exercise")
+
+annotation_colors <- list(
+  Exercise = c("No exercise" = "#E89278", "Exercise" = "#56B4E9"),
+  Lesion   = c("Control" = "grey70", "MPTP" = "grey20")
+)
+
+sample_order <- c(
+  "MC1-1","MC1-2","MC1-3","MC1-4",
+  "MC2-1","MC2-2","MC2-3",
+  "MC3-1","MC3-2","MC3-3",
+  "MC4-1","MC4-2"
+)
+
+dist_heatmap <- Heatmap(
+  sample_dist_mat,
+  name                     = "Distance",
+  col                      = colorRamp2(c(0, 75, 150), c("#2C7BB6", "#FFFFBF", "#D7191C")),
+  column_order             = sample_order,
+  row_order                = sample_order,
+  top_annotation           = HeatmapAnnotation(
+    Exercise = annotation_col$Exercise,
+    Lesion   = annotation_col$Lesion,
+    col      = annotation_colors
+  ),
+  show_row_names           = TRUE,
+  show_column_names        = TRUE,
+  column_title             = "Sample-to-sample transcriptomic distances",
+  clustering_method_rows   = "complete",
+  clustering_method_columns = "complete"
+)
+
+png(
+  filename = "../results/figures/sample_distance_heatmap_plot.png",
+  width = 7 * 300, height = 5 * 300, res = 300
+)
+dist_heatmap
+dev.off()
+
+dist_heatmap
+```
+
+---
+
+# Differential Expression
+
+## Contrast Helper
+
+```{r contrast-helper}
+# define contrasts: numerator vs denominator
+contrast_list <- list(
+  MC2_vs_MC4 = c("group", "MPTP_no_exercise",    "control_no_exercise"),
+  MC1_vs_MC2 = c("group", "MPTP_exercise",        "MPTP_no_exercise"),
+  MC3_vs_MC4 = c("group", "control_exercise",     "control_no_exercise")
+)
+
+# returns raw (for fgsea) and ashr-shrunken (for plotting) results
+run_contrast <- function(dds, contrast) {
+  res_raw    <- results(dds, contrast = contrast)
+  res_shrunk <- lfcShrink(dds, contrast = contrast, res = res_raw, type = "ashr")
+  res_raw    <- res_raw[order(res_raw$pvalue), ]
+  res_shrunk <- res_shrunk[order(res_shrunk$pvalue), ]
+  list(raw = res_raw, shrunk = res_shrunk)
+}
+```
+
+```{r run-contrasts}
+MC1_MC2 <- run_contrast(dds, contrast_list$MC1_vs_MC2)
+MC2_MC4 <- run_contrast(dds, contrast_list$MC2_vs_MC4)
+MC3_MC4 <- run_contrast(dds, contrast_list$MC3_vs_MC4)
+```
+
+```{r gene-map}
+# shared ensembl -> symbol map used throughout
+gene_map <- AnnotationDbi::select(
+  org.Mm.eg.db,
+  keys    = rownames(MC1_MC2$shrunk),
+  keytype = "ENSEMBL",
+  columns = "SYMBOL"
+)
+
+MC1_MC2$shrunk$gene_name <- gene_map$SYMBOL[
+  match(rownames(MC1_MC2$shrunk), gene_map$ENSEMBL)]
+MC1_MC2$shrunk$gene_name[is.na(MC1_MC2$shrunk$gene_name)] <-
+  rownames(MC1_MC2$shrunk)[is.na(MC1_MC2$shrunk$gene_name)]
+
+MC1_MC2$raw$gene_name <- gene_map$SYMBOL[
+  match(rownames(MC1_MC2$raw), gene_map$ENSEMBL)]
+MC3_MC4$raw$gene_name <- gene_map$SYMBOL[
+  match(rownames(MC3_MC4$raw), gene_map$ENSEMBL)]
+```
+
+## MPTP vs Control (MC2 vs MC4)
+
+```{r volcano-mc2-mc4}
+# no genes pass adjusted p threshold at this chronic time point
+EnhancedVolcano(
+  MC2_MC4$shrunk,
+  lab            = rownames(MC2_MC4$shrunk),
+  x              = "log2FoldChange",
+  y              = "padj",
+  pCutoff        = 0.05,
+  FCcutoff       = 1,
+  title          = "MPTP vs Control (no exercise)",
+  subtitle       = NULL
+)
+```
+
+## MPTP + Exercise vs MPTP (MC1 vs MC2)
+
+```{r volcano-mc1-mc2, fig.width=9, fig.height=6}
+genes_to_label <- c("Fosl2", "Egr1", "Nr4a1", "Nr4a3")
+
+keyvals <- ifelse(
+  MC1_MC2$shrunk$padj < 0.05 & MC1_MC2$shrunk$log2FoldChange > 0, "red",
+  ifelse(
+    MC1_MC2$shrunk$padj < 0.05 & MC1_MC2$shrunk$log2FoldChange < 0, "blue",
+    "grey85"
+  )
+)
+names(keyvals) <- rep("NS", length(keyvals))
+names(keyvals)[MC1_MC2$shrunk$padj < 0.05 & MC1_MC2$shrunk$log2FoldChange > 0] <- "Up"
+names(keyvals)[MC1_MC2$shrunk$padj < 0.05 & MC1_MC2$shrunk$log2FoldChange < 0] <- "Down"
+
+volcano_MC1_MC2 <- EnhancedVolcano(
+  MC1_MC2$shrunk,
+  lab              = MC1_MC2$shrunk$gene_name,
+  selectLab        = genes_to_label,
+  x                = "log2FoldChange",
+  y                = "padj",
+  xlab             = bquote(~Log[2]~ "fold change"),
+  ylab             = bquote(~-Log[10]~ "adjusted p-value"),
+  FCcutoff         = Inf,
+  pCutoff          = 0.05,
+  cutoffLineWidth  = 0,
+  xlim             = c(-4, 4),
+  ylim             = c(0, 4),
+  colCustom        = keyvals,
+  pointSize        = 3.5,
+  labSize          = 7,
+  boxedLabels      = TRUE,
+  drawConnectors   = TRUE,
+  widthConnectors  = 0.6,
+  colConnectors    = "black",
+  title            = NULL,
+  subtitle         = NULL,
+  caption          = NULL,
+  labFace          = "bold"
+)
+
+volcano_MC1_MC2
+
+ggsave(
+  filename = "../results/figures/poster_volcano_MC1_MC2.png",
+  plot     = volcano_MC1_MC2,
+  width    = 11, height = 7, units = "in", dpi = 300
+)
+```
+
+## Control + Exercise vs Control (MC3 vs MC4)
+
+```{r volcano-mc3-mc4}
+# no genes pass adjusted p threshold; exercise alone does not drive single-gene changes in bulk striatum
+EnhancedVolcano(
+  MC3_MC4$shrunk,
+  lab      = rownames(MC3_MC4$shrunk),
+  x        = "log2FoldChange",
+  y        = "padj",
+  pCutoff  = 0.05,
+  FCcutoff = 1,
+  title    = "Control + Exercise vs Control",
+  subtitle = NULL
+)
+```
+
+---
+
+# Pathway Enrichment (FGSEA)
+
+```{r gene-sets}
+msig <- msigdbr(
+  db_species = "MM",
+  species    = "Mus musculus",
+  collection = "M5"
+) %>%
+  dplyr::select(gs_name, gene_symbol) %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+```
+
+```{r fgsea-function}
+run_fgsea <- function(res_raw, pathways) {
+  res_raw <- res_raw[!is.na(res_raw$stat) & !is.na(res_raw$gene_name), ]
+  # deduplicate: keep highest |stat| per gene symbol
+  res_raw <- as.data.frame(res_raw) %>%
+    dplyr::group_by(gene_name) %>%
+    dplyr::slice_max(order_by = abs(stat), n = 1) %>%
+    dplyr::ungroup()
+  ranks <- setNames(res_raw$stat, res_raw$gene_name)
+  fgseaMultilevel(pathways = pathways, stats = ranks)
+}
+```
+
+```{r run-fgsea}
+fg_MC1_MC2 <- run_fgsea(MC1_MC2$raw, msig)
+fg_MC3_MC4 <- run_fgsea(MC3_MC4$raw, msig)
+```
+
+## Pathway Overlap
+
+```{r pathway-overlap}
+sig_MC1_MC2 <- fg_MC1_MC2 %>% filter(padj < 0.05)
+sig_MC3_MC4 <- fg_MC3_MC4 %>% filter(padj < 0.05)
+shared_pathways <- intersect(sig_MC1_MC2$pathway, sig_MC3_MC4$pathway)
+
+fg_MC1_MC2 %>%
+  filter(pathway %in% shared_pathways) %>%
+  dplyr::select(pathway, NES, padj) %>%
+  arrange(desc(abs(NES)))
+```
+
+## FGSEA Dotplot — Selected Transcription Pathways
+
+```{r fgsea-dotplot}
+selected_patterns <- c(
+  "GOMF_TRANSCRIPTION_REGULATOR_ACTIVITY",
+  "GOBP_POSITIVE_REGULATION_OF_TRANSCRIPTION_BY_RNA_POLYMERASE_II",
+  "GOCC_TRANSCRIPTION_REGULATOR_COMPLEX",
+  "GOMF_CHROMATIN_BINDING"
+)
+
+fg_df <- as.data.frame(fg_MC1_MC2)
+match_idx   <- unique(unlist(lapply(selected_patterns, function(pat) {
+  grep(pat, fg_df$pathway, ignore.case = TRUE, value = FALSE)
+})))
+# remove any unexpected extra rows (RNA Pol III)
+match_idx <- match_idx[-3] 
+
+sel_df <- fg_df[match_idx, ] %>%
+  mutate(
+    pathway_clean = pathway %>%
+      gsub("^GOBP_|^GOCC_|^GOMF_", "", .) %>%
+      gsub("_", " ", .) %>%
+      stringr::str_to_title()
+  )
+
+# manual short labels for plot
+sel_df$pathway_clean <- c(
+  "Transcription\nRegulator Activity",
+  "Positive Regulation of\nTranscription (RNA Pol II)",
+  "Transcription \nRegulator Complex",
+  "Chromatin \nBinding"
+)
+sel_df$pathway_clean <- reorder(sel_df$pathway_clean, sel_df$NES)
+
+p_sel <- ggplot(sel_df, aes(x = NES, y = pathway_clean)) +
+  geom_point(aes(color = padj),size=15)+
+scale_color_gradient(
+  low = "#FDB863",
+  high = "#B2182B",
+  trans = "reverse",
+  breaks = c(0.003, 0.0015, 0.00075, 0.0003),
+  labels = c("0.003", "0.0015", "0.00075", "0.0003"))+
+scale_size_continuous(range = c(12, 20), breaks = pretty(-log10(sel_df$padj))) +
+  scale_x_continuous(limits = c(0, max(sel_df$NES) * 1.05)) +
+  coord_cartesian(xlim = c(1.35, 1.60))+
+  labs(
+    x = "Normalized Enrichment Score (NES)",
+    y = NULL,
+    color = "Adjusted p-value",
+    size = NULL
+  ) +
+  guides(
+  color = guide_colorbar(barwidth = 12, barheight = 1)
+)+
+  theme_classic(base_size = 14) +
+  theme(
+    aspect.ratio = 0.35,
+  axis.text.y = element_text(size = 17, face = "bold", color = "black"),
+  axis.title.x = element_text(size = 17, face = "bold", color = "black"),
+  axis.text = element_text(size = 17, color = "black"),
+  legend.position = "top",
+  legend.direction = "horizontal",
+  legend.text = element_text(size = 12, color = "black"),
+  legend.title = element_text(size = 17, face = "bold", color = "black"),
+)
+p_sel
+
+ggsave(
+  "../results/figures/poster_FGSEA_selected_transcription_paths.png",
+  p_sel, width = 10, height = 5, dpi = 300
+)
+```
+
+---
+
+# TPM Normalization & Candidate Gene Expression
+
+## Compute TPM
+
+```{r compute-tpm}
+metadata <- metadata %>% tibble::rownames_to_column(var = "Sample")
+
+count_cols <- setdiff(colnames(counts_df), c("gene_id", "gene_name", "length"))
+
+# fetch gene lengths via biomart
+ensembl <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+bm <- getBM(
+  attributes = c("ensembl_gene_id", "start_position", "end_position"),
+  filters    = "ensembl_gene_id",
+  values     = counts_df$gene_id,
+  mart       = ensembl
+) %>%
+  mutate(length = abs(end_position - start_position) + 1) %>%
+  dplyr::select(ensembl_gene_id, length)
+colnames(bm)[1] <- "gene_id"
+
+counts_df <- left_join(counts_df, bm, by = "gene_id") %>%
+  filter(!is.na(length)) %>%
+  mutate(length_kb = length / 1000)
+
+raw_counts_mat <- counts_df %>%
+  dplyr::select(all_of(count_cols)) %>%
+  as.matrix()
+rownames(raw_counts_mat) <- counts_df$gene_id
+
+rpk             <- raw_counts_mat / counts_df$length_kb
+scaling_factors <- colSums(rpk, na.rm = TRUE) / 1e6
+tpm_mat         <- sweep(rpk, 2, scaling_factors, FUN = "/")
+
+tpm_df <- as.data.frame(tpm_mat) %>%
+  tibble::rownames_to_column(var = "gene_id") %>%
+  pivot_longer(cols = -gene_id, names_to = "Sample", values_to = "TPM")
+
+gene_id_map <- counts_df %>% dplyr::select(gene_id, gene_name)
+tpm_df      <- left_join(tpm_df, gene_id_map, by = "gene_id")
+```
+
+## TPM Boxplots
+
+```{r tpm-setup}
+genes_of_interest <- c(
+  "Fosl2", "Egr1", "Nr4a1", "Nr4a3", "Htr7", "Prlr", "Arhgef16", "Ormdl2",
+  "Fos", "Junb", "Bdnf", "Arc", "Camk2a", "Mapk3", "Gfap", "Rbfox3",
+  "Dusp1", "Dusp6", "Slc6a3", "Th", "Ddc", "Slc18a2", "Drd1", "Drd2",
+  "Ppp1r1b", "Adcy5", "Elk1", "Jun", "Jund", "Atf7",
+  "Prkca", "Prkcb", "Prkcg", "Prkcd", "Prkaca",
+  "Nr4a2", "Ngf", "Pvr", "Gria1", "Gria2", "Slc2a1", "Thbs1",
+  "Maoa", "Maob", "Comt", "Bsg","mt-Co1","mt-Co2","mt-Co3", "Cox4i1", "Cox5a", "Cox6a1","Cox7a1", "Adrb1","Adrb2","Adrb3","Adra1d","Adra2a","Adra2c","Adra1a","Adra1b","Adra2b"
+)
+
+group_levels <- c(
+  "control_no_exercise", "control_exercise",
+  "MPTP_no_exercise",    "MPTP_exercise"
+)
+
+group_labels <- c(
+  "control_no_exercise" = "Saline",
+  "control_exercise"    = "Saline + Exercise",
+  "MPTP_no_exercise"    = "MPTP",
+  "MPTP_exercise"       = "MPTP + Exercise"
+)
+
+plot_df <- tpm_df %>%
+  filter(gene_name %in% genes_of_interest) %>%
+  left_join(metadata, by = "Sample") %>%
+  mutate(
+    logTPM      = log2(TPM + 1),
+    group       = factor(group, levels = group_levels),
+    group_label = factor(group_labels[as.character(group)],
+                         levels = unname(group_labels))
+  )
+
+comparisons_tpm <- list(
+  c("MPTP", "MPTP + Exercise"),
+  c("Saline", "Saline + Exercise")
+)
+
+dir.create("../results/figures/tpm_boxplots", recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r tpm-faceted, fig.width=14, fig.height=14}
+# faceted overview — all genes in one plot
+tpm_facet <- ggplot(plot_df, aes(x = group_label, y = logTPM, fill = group_label)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5) +
+  geom_jitter(width = 0.15, size = 1.5) +
+  facet_wrap(~ gene_name, scales = "free_y", ncol = 4) +
+  theme_minimal(base_size = 14) +
+  labs(x = NULL, y = "log2(TPM + 1)", title = "TPM-normalized expression by group") +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+tpm_facet
+
+ggsave(
+  filename = "../results/figures/tpm_boxplots/tpm_all_genes_faceted.png",
+  plot     = tpm_facet,
+  width    = 14, height = 14, units = "in", dpi = 300
+)
+```
+
+```{r tpm-individual}
+# individual plot per gene saved to tpm_boxplots/
+for (g in genes_of_interest) {
+  
+  df_g <- plot_df %>% filter(gene_name == g)
+
+  p <- ggplot(df_g, aes(x = group_label, y = logTPM, fill = group_label)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+    geom_jitter(width = 0.15, size = 2) +
+    stat_compare_means(
+      comparisons = comparisons_tpm,
+      method      = "t.test",
+      label       = "p.signif",
+      hide.ns     = FALSE,
+      tip.length  = 0.02
+    ) +
+    stat_compare_means(
+      method   = "anova",
+      label.x  = 3.5,
+      label.y  = max(df_g$logTPM, na.rm = TRUE) * 1.5
+    ) +
+    theme_classic(base_size = 14) +
+    labs(
+      title = paste0(g, " (TPM-normalized)"),
+      x     = NULL,
+      y     = "log2(TPM + 1)"
+    ) +
+    theme(
+      axis.text.x     = element_text(angle = 45, hjust = 1),
+      legend.position = "none"
+    )
+
+  ggsave(
+    filename = paste0("../results/figures/tpm_boxplots/tpm_", g, ".png"),
+    plot     = p, width = 7, height = 6, units = "in", dpi = 300
+  )
+}
+```
+
+---
+
+# Interaction Analysis
+
+## Two-Way ANOVA
+
+```{r two-way-anova}
+interaction_genes <- c("Fosl2", "Nr4a1", "Nr4a3", "Ormdl2", "Egr1")
+
+results_list <- lapply(interaction_genes, function(g) {
+  df_g  <- plot_df %>% filter(gene_name == g)
+  model <- lm(logTPM ~ lesion * exercise, data = df_g)
+  an    <- anova(model)
+
+  data.frame(
+    Gene                  = g,
+    Lesion_p              = an["lesion",           "Pr(>F)"],
+    Exercise_p            = an["exercise",          "Pr(>F)"],
+    Interaction_p         = an["lesion:exercise",   "Pr(>F)"],
+    Exercise_in_MPTP_p    = t.test(logTPM ~ exercise, data = df_g %>% filter(lesion == "MPTP"))$p.value,
+    Exercise_in_Control_p = t.test(logTPM ~ exercise, data = df_g %>% filter(lesion == "control"))$p.value
+  )
+})
+
+results_table <- bind_rows(results_list) %>%
+  mutate(across(-Gene, ~ signif(.x, 3)))
+
+colnames(results_table) <- c(
+  "Gene", "Lesion (main effect)", "Exercise (main effect)",
+  "Lesion × Exercise (interaction)", "Exercise effect in MPTP", "Exercise effect in Control"
+)
+
+results_table
+```
+
+
+---
+
+# VST Boxplots
+
+```{r vst-setup}
+# fit group-factor model and run LRT for interaction
+metadata$group <- factor(metadata$group, levels = group_levels)
+
+dds_group <- DESeqDataSetFromMatrix(
+  countData = count_mat,
+  colData   = metadata,
+  design    = ~ group
+)
+dds_group <- DESeq(dds_group)
+
+dds_int <- DESeqDataSetFromMatrix(
+  countData = count_mat,
+  colData   = metadata,
+  design    = ~ lesion * exercise
+)
+dds_int <- DESeq(dds_int, test = "LRT", reduced = ~ lesion + exercise)
+
+res_lrt          <- results(dds_int)
+res_ex_in_MPTP   <- results(dds_group, contrast = c("group", "MPTP_exercise",    "MPTP_no_exercise"))
+res_ex_in_ctrl   <- results(dds_group, contrast = c("group", "control_exercise", "control_no_exercise"))
+shrink_ex_in_MPTP <- lfcShrink(dds_group,
+                                contrast = c("group", "MPTP_exercise", "MPTP_no_exercise"),
+                                type     = "ashr")
+
+vst_mat <- assay(vst(dds_group, blind = FALSE))
+
+# ensembl -> symbol lookup for vst matrix
+sym2ens <- gene_map %>%
+  dplyr::filter(!is.na(SYMBOL)) %>%
+  dplyr::distinct(SYMBOL, .keep_all = TRUE) %>%
+  dplyr::select(SYMBOL, ENSEMBL)
+
+p_to_stars <- function(p) {
+  if (is.na(p))    return("ns")
+  if (p < 0.001)   return("***")
+  if (p < 0.01)    return("**")
+  if (p < 0.05)    return("*")
+  return("ns")
+}
+
+dir.create("../results/figures/vst_boxplots", recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r vst-plot-function}
+# single-gene VST boxplot with DESeq2-derived pairwise annotations
+plot_vst_gene <- function(symbol) {
+  # safe group label mapping (used in many chunks)
+  group_labels <- c(
+    "control_no_exercise" = "Saline",
+    "control_exercise"    = "Saline + Exercise",
+    "MPTP_no_exercise"    = "MPTP",
+    "MPTP_exercise"       = "MPTP + Exercise"
+  )
+
+  # map SYMBOL -> ENSEMBL (safe)
+  ens <- sym2ens$ENSEMBL[match(symbol, sym2ens$SYMBOL)]
+  if (is.na(ens) || length(ens) == 0) {
+    warning(sprintf("No ENSEMBL mapping for symbol '%s' — plot will still be produced but brackets will show ns", symbol))
+  }
+  if (!is.na(ens) && !(ens %in% rownames(vst_mat))) {
+    stop(sprintf("Mapped ENSEMBL '%s' for symbol '%s' not present in vst matrix", ens, symbol))
+  }
+
+  # build plotting dataframe
+  df <- data.frame(
+    Sample = colnames(vst_mat),
+    vst    = if (!is.na(ens)) as.numeric(vst_mat[ens, , drop=TRUE]) else NA_real_,
+    metadata,
+    stringsAsFactors = FALSE
+  ) %>%
+    mutate(
+      group_label = factor(group_labels[as.character(group)], levels = unname(group_labels))
+    )
+
+  # helper to fetch DESeq2 padj (fallback to pvalue)
+  get_p <- function(res, id) {
+    if (is.null(res) || is.na(id) || !(id %in% rownames(res))) return(NA_real_)
+    p <- res[id, "padj"]
+    if (!is.na(p)) return(as.numeric(p))
+    pv <- res[id, "pvalue"]
+    if (!is.na(pv)) return(as.numeric(pv))
+    return(NA_real_)
+  }
+
+  # DESeq2 contrast p-values (exercise effect within groups)
+  p_ex_MPTP <- get_p(res_ex_in_MPTP, ens)   # exercise effect in MPTP
+  p_ex_ctrl <- get_p(res_ex_in_ctrl,  ens)   # exercise effect in control (Saline)
+
+  # shrunken LFC label if available
+  lfc_label <- NA
+  if (!is.null(shrink_ex_in_MPTP) && !is.na(ens) && ens %in% rownames(shrink_ex_in_MPTP)) {
+    lv <- shrink_ex_in_MPTP[ens, "log2FoldChange"]
+    if (!is.na(lv)) lfc_label <- signif(lv, 3)
+  }
+
+  sub_txt <- paste0(
+    "Exercise (MPTP) FDR = ", ifelse(is.na(p_ex_MPTP), "NA", signif(p_ex_MPTP, 2)),
+    if (!is.na(lfc_label)) paste0("  |  shrunken LFC = ", lfc_label) else ""
+  )
+
+  # dynamic y spacing
+  y_max <- max(df$vst, na.rm = TRUE)
+  y_min <- min(df$vst, na.rm = TRUE)
+  span  <- ifelse(is.finite(y_max - y_min) && (y_max - y_min) > 0, y_max - y_min, 1)
+  gap   <- span * 0.12
+
+  # build pval table using the same label strings shown in the plot
+  pval_df <- data.frame(
+    group1     = c("MPTP", "Saline"),
+    group2     = c("MPTP + Exercise", "Saline + Exercise"),
+    y.position = c(y_max + gap * 0.6, y_max + gap * 1.2),
+    p          = c(p_ex_MPTP, p_ex_ctrl),
+    p.signif   = c(p_to_stars(p_ex_MPTP), p_to_stars(p_ex_ctrl)),
+    label      = c(
+      ifelse(is.na(p_ex_MPTP), "ns", format.pval(p_ex_MPTP, digits = 2)),
+      ifelse(is.na(p_ex_ctrl),  "ns", format.pval(p_ex_ctrl,  digits = 2))
+    ),
+    stringsAsFactors = FALSE
+  )
+
+  # plot
+  p <- ggplot(df, aes(x = group_label, y = vst, fill = group_label)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.65, width = 0.6, color = "black") +
+    geom_jitter(aes(color = group_label), width = 0.12, size = 2, show.legend = FALSE) +
+    scale_fill_brewer(palette  = "Set2") +
+    scale_color_brewer(palette = "Dark2") +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.15))) +
+    coord_cartesian(ylim = c(y_min, y_max + gap * 2), clip = "off") +
+    stat_pvalue_manual(
+      pval_df,
+      label      = "p.signif",   # change to "label" to show numeric adjusted p-value
+      xmin       = "group1",
+      xmax       = "group2",
+      y.position = "y.position",
+      tip.length = 0.02,
+      size       = 5,
+      bracket.size = 0.8
+    ) +
+    theme_classic(base_size = 14) +
+    labs(title = symbol, subtitle = sub_txt, x = NULL, y = "VST expression") +
+    theme(
+      legend.position = "none",
+      plot.title      = element_text(face = "bold", size = 16),
+      plot.subtitle   = element_text(size = 10),
+      axis.text.x     = element_text(angle = 45, hjust = 1, size = 11),
+      axis.title      = element_text(face = "bold"),
+      plot.margin     = margin(t = 15, r = 30, b = 10, l = 10)
+    )
+
+  return(p)
+}
+```
+
+```{r vst-faceted, fig.width=14, fig.height=14}
+# build tidy df for all genes of interest using vst values
+vst_long <- lapply(genes_of_interest, function(g) {
+  ens <- sym2ens$ENSEMBL[sym2ens$SYMBOL == g]
+  if (length(ens) == 0 || !ens[1] %in% rownames(vst_mat)) return(NULL)
+  data.frame(
+    Sample    = colnames(vst_mat),
+    vst       = as.numeric(vst_mat[ens[1], ]),
+    gene_name = g,
+    stringsAsFactors = FALSE
+  )
+}) %>%
+  bind_rows() %>%
+  left_join(metadata, by = "Sample") %>%
+  mutate(
+    group_label = factor(group_labels[as.character(group)],
+                         levels = unname(group_labels))
+  )
+
+vst_facet <- ggplot(vst_long, aes(x = group_label, y = vst, fill = group_label)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5) +
+  geom_jitter(width = 0.15, size = 1.5) +
+  facet_wrap(~ gene_name, scales = "free_y", ncol = 4) +
+  theme_minimal(base_size = 14) +
+  labs(x = NULL, y = "VST expression", title = "VST expression by group") +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+vst_facet
+
+ggsave(
+  filename = "../results/figures/vst_boxplots/vst_all_genes_faceted.png",
+  plot     = vst_facet,
+  width    = 14, height = 14, units = "in", dpi = 300
+)
+```
+
+```{r vst-individual}
+# individual plot per gene saved to vst_boxplots/
+for (g in genes_of_interest) {
+  p <- tryCatch(plot_vst_gene(g), error = function(e) {
+    message("skipping ", g, ": ", e$message); NULL
+  })
+  if (!is.null(p)) {
+    ggsave(
+      filename = paste0("../results/figures/vst_boxplots/vst_", g, ".png"),
+      plot     = p, width = 7, height = 6, units = "in", dpi = 300
+    )
+  }
+}
+```
+
+---
+
+# GSVA
+
+```{r gsva, message=FALSE}
+expr_mat <- assay(vsd)
+
+# map ensembl rownames to symbols
+gene_map_gsva <- AnnotationDbi::select(
+  org.Mm.eg.db,
+  keys    = rownames(expr_mat),
+  keytype = "ENSEMBL",
+  columns = "SYMBOL"
+) %>%
+  dplyr::filter(!is.na(SYMBOL)) %>%
+  dplyr::distinct(ENSEMBL, .keep_all = TRUE)
+
+expr_mat_sym <- expr_mat[gene_map_gsva$ENSEMBL, ]
+rownames(expr_mat_sym) <- gene_map_gsva$SYMBOL
+
+# average across duplicated gene symbols
+sym            <- rownames(expr_mat_sym)
+grp            <- as.integer(factor(sym))
+summed         <- rowsum(expr_mat_sym, group = grp)
+counts_per_sym <- as.vector(table(sym)[levels(factor(sym))])
+expr_mat_final <- sweep(summed, 1, counts_per_sym, FUN = "/")
+rownames(expr_mat_final) <- levels(factor(sym))
+
+sel_paths <- c(
+  "GOMF_TRANSCRIPTION_REGULATOR_ACTIVITY",
+  "GOCC_TRANSCRIPTION_REGULATOR_COMPLEX"
+)
+gs_list_sel <- msig[intersect(sel_paths, names(msig))]
+
+gsva_scores <- gsva(
+  expr        = expr_mat_final,
+  gset.idx.list = gs_list_sel,
+  method      = "ssgsea",
+  kcdf        = "Gaussian",
+  abs.ranking = TRUE
+)
+```
+
+```{r gsva-plot, fig.width=8, fig.height=5}
+pretty_map <- c(
+  "GOCC_TRANSCRIPTION_REGULATOR_COMPLEX"  = "Transcription Regulator\nComplex",
+  "GOMF_TRANSCRIPTION_REGULATOR_ACTIVITY" = "Transcription Regulator\nActivity"
+)
+
+gsva_plot_df <- as.data.frame(t(gsva_scores)) %>%
+  tibble::rownames_to_column("sample") %>%
+  pivot_longer(-sample, names_to = "pathway", values_to = "score") %>%
+  left_join(metadata, by = c("sample" = "Sample")) %>%
+  mutate(
+    condition = factor(
+      case_when(
+        lesion == "control" & exercise == "no_exercise" ~ "Saline",
+        lesion == "control" & exercise == "exercise"    ~ "Saline + Exercise",
+        lesion == "MPTP"    & exercise == "no_exercise" ~ "MPTP",
+        lesion == "MPTP"    & exercise == "exercise"    ~ "MPTP + Exercise"
+      ),
+      levels = c("Saline", "Saline + Exercise", "MPTP", "MPTP + Exercise")
+    ),
+    pathway_label = pretty_map[pathway]
+  )
+
+comparisons <- list(
+  c("Saline", "Saline + Exercise"),
+  c("MPTP",   "MPTP + Exercise")
+)
+
+p_gsva <- ggplot(gsva_plot_df, aes(x = condition, y = score)) +
+  geom_boxplot(outlier.shape = NA, width = 0.6, alpha = 0.9) +
+  geom_jitter(width = 0.08, size = 2, color = "black") +
+  facet_wrap(~ pathway_label, scales = "free_y") +
+  stat_compare_means(
+    comparisons = comparisons,
+    method      = "t.test",
+    label       = "p.signif",
+    hide.ns     = TRUE,
+    tip.length  = 0.02
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    strip.text   = element_text(face = "bold"),
+    axis.text.x  = element_text(angle = 30, hjust = 1),
+    axis.title.x = element_blank()
+  ) +
+  labs(x = NULL, y = "GSVA pathway score")
+
+p_gsva
+
+ggsave(
+  filename = "../results/figures/gsva_transcription_boxplot.png",
+  plot     = p_gsva, width = 8, height = 5, dpi = 300
+)
+```
+## Interaction Panel Plot (Poster)
+
+```{r poster-boxplots-fosl2-nr4a1-nr4a3-egr1, fig.width=10, fig.height=7}
+genes_to_show <- c("Fosl2", "Nr4a1", "Nr4a3", "Egr1")
+
+label_map_cond <- c(
+  "control_no_exercise" = "Saline",
+  "control_exercise"    = "Saline + Exercise",
+  "MPTP_no_exercise"    = "MPTP",
+  "MPTP_exercise"       = "MPTP + Exercise"
+)
+
+plot_df2 <- plot_df %>%
+  filter(gene_name %in% genes_to_show) %>%
+  mutate(
+    group_label = factor(
+      label_map_cond[as.character(group)],
+      levels = c("Saline", "Saline + Exercise", "MPTP", "MPTP + Exercise")
+    )
+  )
+
+# interaction p-values from anova above 
+interaction_pvals <- data.frame(
+  Gene          = c("Fosl2", "Nr4a1", "Nr4a3", "Egr1"),
+  p_interaction = c(0.00063, 0.0142, 0.00154, 0.03737)
+)
+
+plot_gene_panel <- function(gene) {
+  df       <- plot_df2 %>% filter(gene_name == gene)
+  y_max    <- max(df$logTPM, na.rm = TRUE)
+  y_min    <- min(df$logTPM, na.rm = TRUE)
+  y_top    <- y_max + 0.5
+  p_inter  <- interaction_pvals$p_interaction[interaction_pvals$Gene == gene]
+  sub_txt  <- paste0("Interaction FDR = ", formatC(p_inter, format = "e", digits = 2))
+  
+  # extract the DESeq2 p-value for the gene
+  ens <- sym2ens$ENSEMBL[match(gene, sym2ens$SYMBOL)]
+  p_mptp <- res_ex_in_MPTP[ens, "padj"]
+  p_ctrl <- res_ex_in_ctrl[ens, "padj"]
+  
+  pval_df <- data.frame(
+    group1 = c("MPTP", "Saline"),
+    group2 = c("MPTP + Exercise", "Saline + Exercise"),
+    y.position = c(y_max + 0.1, y_max + 0.25),
+    p = c(p_mptp, p_ctrl),
+    p.signif = c(p_to_stars(p_mptp), 
+                 p_to_stars(p_ctrl)))
+  ggplot(df, aes(x = group_label, y = logTPM, fill = group_label)) +
+    geom_boxplot(outlier.shape = NA, width = 0.6, linewidth = 0.6) +
+    geom_jitter(width = 0.12, size = 2.2, color = "black") +
+    stat_pvalue_manual(
+      pval_df,
+      label = "p.signif",
+      xmin = "group1",
+      xmax = "group2",
+      y.position = "y.position",
+      tip.length = 0.02,
+      size = 6,
+      bracket.size = 1) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0))) +
+    coord_cartesian(ylim = c(y_min - 0.05, y_top), clip = "off") +
+    scale_fill_brewer(palette = "Set1") +
+    theme_classic(base_size = 17) +
+    labs(title = gene, subtitle = sub_txt, x = NULL, y = "Expression (log2 TPM + 1)") +
+    theme(
+      plot.title    = element_text(face = "bold", size = 22),
+      plot.subtitle = element_text(size = 9, margin = margin(b = 6)),
+      axis.text.x   = element_text(angle = 30, hjust = 1, size = 14, color = "black"), # angle = 40, 
+      axis.title.y  = element_text(face = "bold", size = 14),
+      axis.text.y   = element_text(size = 12),
+      plot.margin   = margin(t = 50, r = 30, b = 12, l = 12),
+      legend.position = "none"
+    )
+}
+
+plots    <- lapply(genes_to_show, plot_gene_panel)
+combined <- plot_grid(plotlist = plots, ncol = 2, align = "hv")
+combined
+
+ggsave(
+  filename = "../results/figures/poster_panel_boxplot.png",
+  plot = combined, width = 9, height = 10, units = "in", dpi = 300
+)
+```
+
+
+---
+
+# Candidate Gene Selection for qPCR
+
+```{r candidate-genes}
+fg_sig <- fg_MC1_MC2 %>% filter(padj < 0.05)
+
+# genes in leading edge of any significant pathway
+leading_edge_genes <- as.data.frame(fg_sig) %>%
+  dplyr::select(pathway, leadingEdge) %>%
+  tidyr::unnest(leadingEdge) %>%
+  rename(gene = leadingEdge)
+
+le_genes_unique <- unique(leading_edge_genes$gene)
+
+# significant DEGs
+deg_sig <- as.data.frame(MC1_MC2$shrunk) %>%
+  filter(padj < 0.05) %>%
+  pull(gene_name) %>%
+  unique()
+
+# overlap: both DEG and in a leading edge
+overlap_genes <- intersect(le_genes_unique, deg_sig)
+message("Overlap genes (DEG ∩ leading edge): ", length(overlap_genes))
+message("Fraction of DEGs in LE: ", round(length(overlap_genes) / length(deg_sig), 3))
+
+candidate_qpcr <- as.data.frame(MC1_MC2$shrunk) %>%
+  filter(gene_name %in% overlap_genes) %>%
+  arrange(padj) %>%
+  dplyr::select(gene_name, log2FoldChange, padj)
+
+# annotate with pathway membership
+qpcr_annotation <- leading_edge_genes %>%
+  filter(gene %in% candidate_qpcr$gene_name) %>%
+  group_by(gene) %>%
+  summarise(
+    leading_edge_pathways = paste(unique(pathway), collapse = "; "),
+    n_pathways            = n_distinct(pathway),
+    .groups               = "drop"
+  )
+
+candidate_qpcr_annotated <- candidate_qpcr %>%
+  left_join(qpcr_annotation, by = c("gene_name" = "gene")) %>%
+  mutate(
+    leading_edge_pathways_clean = leading_edge_pathways %>%
+      gsub("^GOBP_|^GOCC_|^GOMF_", "", .) %>%
+      gsub("_", " ", .)
+  )
+
+candidate_qpcr_annotated
+```
+
+---
+
+# FGSEA Enrichment Plots
+
+```{r fgsea-enrichment-plots}
+# rebuild ranks for plotEnrichment
+get_ranks <- function(res_raw) {
+  df <- as.data.frame(res_raw) %>%
+    filter(!is.na(stat) & !is.na(gene_name)) %>%
+    group_by(gene_name) %>%
+    slice_max(order_by = abs(stat), n = 1) %>%
+    ungroup()
+  setNames(df$stat, df$gene_name)
+}
+
+ranks <- get_ranks(MC1_MC2$raw)
+
+selected_paths <- c(
+  "GOMF_TRANSCRIPTION_REGULATOR_ACTIVITY",
+  "GOCC_TRANSCRIPTION_REGULATOR_COMPLEX"
+)
+selected_paths <- intersect(selected_paths, names(msig))
+
+dir.create("../results/figures/fgsea_enrichment_plots", recursive = TRUE, showWarnings = FALSE)
+
+for (pid in selected_paths) {
+  r    <- fg_MC1_MC2[fg_MC1_MC2$pathway == pid, ]
+  sub  <- sprintf("NES = %.2f; padj = %.3g; size = %d", r$NES, r$padj, r$size)
+  p    <- plotEnrichment(msig[[pid]], stats = ranks) +
+    labs(title = pid, subtitle = sub) +
+    theme_minimal(base_size = 14)
+  ggsave(
+    filename = paste0("../results/figures/fgsea_enrichment_plots/", pid, ".png"),
+    plot     = p, width = 7, height = 4, dpi = 300
+  )
+}
+```
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

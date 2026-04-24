@@ -1,0 +1,13 @@
+﻿sample,lesion,exercise
+MC1_1,MPTP,exercise
+MC1_2,MPTP,exercise
+MC1_3,MPTP,exercise
+MC1_4,MPTP,exercise
+MC2_1,MPTP,no_exercise
+MC2_2,MPTP,no_exercise
+MC2_3,MPTP,no_exercise
+MC3_1,control,exercise
+MC3_2,control,exercise
+MC3_3,control,exercise
+MC4_1,control,no_exercise
+MC4_2,control,no_exercise

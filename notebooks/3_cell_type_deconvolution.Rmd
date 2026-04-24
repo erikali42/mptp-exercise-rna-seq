@@ -1,0 +1,236 @@
+---
+title: "3. Cell Type Deconvolution -- Exercise-Induced Transcriptomic Remodeling in an MPTP Mouse Model of Parkinson’s Disease"
+author: "Erika Li"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+```{r library loading}
+library(knitr)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(reshape2)
+library(Seurat)
+library(SingleCellExperiment)
+library(S4Vectors)
+library(MuSiC)
+library(AnnotationDbi)
+library(org.Mm.eg.db)
+```
+
+
+```{r GEO data load}
+# read raw single-cell counts from GSE82187, "Cellular Taxonomy of the Mouse Striatum as Revealed by Single-Cell RNAseq"
+sc_counts_raw <- read.csv("../raw_data/GSE82187.csv.gz", row.names = 1, check.names = FALSE)
+sc_counts_raw <- as.data.frame(sc_counts_raw)
+
+# make cell name into row names
+rownames(sc_counts_raw) <- sc_counts_raw$cell.name
+sc_counts_raw$cell.name <- NULL
+
+# pick metadata columns in the single-cell CSV
+meta_cols <- c("type", "experiment", "protocol")
+meta_cols <- intersect(meta_cols, colnames(sc_counts_raw))
+sc_meta <- as.data.frame(sc_counts_raw[, meta_cols, drop = FALSE], stringsAsFactors = FALSE)
+rownames(sc_meta) <- rownames(sc_counts_raw)
+
+# expression columns are the rest
+expr_df <- sc_counts_raw %>% dplyr::select(-all_of(meta_cols))
+
+expr_mat_genes_cells <- t(as.matrix(apply(expr_df, 2, as.numeric)))
+rownames(expr_mat_genes_cells) <- make.unique(colnames(expr_df))
+colnames(expr_mat_genes_cells) <- rownames(expr_df)
+
+# createSeuratObject expects counts matrix with genes in rows and cells in columns
+seurat_ref <- CreateSeuratObject(counts = expr_mat_genes_cells,
+                                 project = "GSE82187",
+                                 min.cells = 3,
+                                 min.features = 200)
+
+seurat_ref <- AddMetaData(seurat_ref, metadata = sc_meta)
+head(seurat_ref@meta.data)
+```
+
+```{r cleaned metadata and counts dataframe load}
+# read our metadata and bulk counts 
+metadata <- readRDS(file = "../clean_data/cleaned_metadata.RDS")
+counts_mat <- readRDS(file = "../clean_data/cleaned_counts_matrix.RDS")
+```
+
+```{r single cell experiment}
+# extract counts and metadata from Seurat
+seurat_counts <- as.matrix(GetAssayData(seurat_ref, slot = "counts"))
+seurat_meta   <- seurat_ref@meta.data
+
+# build SingleCellExperiment with a counts assay
+sce_ref <- SingleCellExperiment(
+  assays = list(counts = seurat_counts),
+  colData = S4Vectors::DataFrame(seurat_meta)
+)
+```
+
+```{r converting symbols to ensembl IDs}
+sc_symbols <- rownames(sce_ref)
+map_df <- AnnotationDbi::select(
+  org.Mm.eg.db,
+  keys = sc_symbols,
+  keytype = "SYMBOL",
+  columns = c("SYMBOL", "ENSEMBL")
+)
+
+# remove NAs and keep first mapping per symbol (if multiple)
+map_df <- map_df[!is.na(map_df$ENSEMBL), ]
+map_unique <- map_df %>%
+  dplyr::group_by(SYMBOL) %>%
+  dplyr::slice(1) %>%
+  dplyr::ungroup()
+
+symbol_to_ens <- setNames(map_unique$ENSEMBL, map_unique$SYMBOL)
+
+# apply mapping to SCE rows
+mapped <- symbol_to_ens[rownames(sce_ref)]
+mapped_idx <- which(!is.na(mapped))
+sce_ref_mapped <- sce_ref[mapped_idx, , drop = FALSE]
+rownames(sce_ref_mapped) <- make.unique(mapped[mapped_idx])
+
+# ensure numeric
+bulk_mtx <- apply(counts_mat, 2, as.numeric)
+bulk_mtx <- as.matrix(bulk_mtx)
+rownames(bulk_mtx) <- rownames(counts_mat)
+
+# intersection of genes
+common_genes <- intersect(rownames(bulk_mtx), rownames(sce_ref_mapped))
+
+# subset both to common genes 
+sce_ref_final <- sce_ref_mapped[common_genes, , drop = FALSE]
+bulk_mtx_final <- bulk_mtx[common_genes, , drop = FALSE]
+```
+
+```{r jitter plot}
+colData(sce_ref_final)$subject <- rownames(colData(sce_ref_final))
+
+
+Est.prop.MuSiC = music_prop(bulk.mtx = bulk_mtx_final , 
+                            sc.sce = sce_ref_final, 
+                            clusters = 'type', 
+                            samples = 'subject', 
+                            select.ct = NULL)
+
+jitter.fig = Jitter_Est(
+  list(data.matrix(Est.prop.MuSiC$Est.prop.weighted), 
+       data.matrix(Est.prop.MuSiC$Est.prop.allgene)), 
+  method.name = c('MuSiC', 'NNLS'), 
+  title = 'Jitter plot of Estimated Cell Proportions'
+)
+print(jitter.fig)
+ggsave(
+  filename = "../results/figures/cell_type_plots/cell_type_jitter_plot.png",
+  plot = jitter.fig,
+  width = 7,
+  height = 6,
+  units = "in",
+  dpi = 300
+)
+```
+
+```{r boxplots}
+est_props <- as.data.frame(Est.prop.MuSiC$Est.prop.weighted)
+est_props$sample <- rownames(est_props)
+metadata$Sample <- rownames(metadata)
+rownames(est_props) <- est_props$sample
+est_props$sample <- NULL
+
+props_long <- melt(as.matrix(est_props))
+colnames(props_long) <- c("Sample", "CellType", "Proportion")
+props_long <- left_join(props_long, metadata, by = "Sample")
+
+for_plot <- props_long %>%
+  filter(CellType == "Neuron")
+for_plot$group<- factor(for_plot$group,
+  levels = c("control_no_exercise",
+             "control_exercise",
+             "MPTP_no_exercise",
+             "MPTP_exercise"))
+
+# plot neuron proportion
+neuron_plot <- ggplot(for_plot, aes(x = group, y = Proportion, fill = group)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(
+    title = "Estimated Neuron Proportions between Groups",
+    y = "Estimated Proportion of Neurons",
+    x = "Group"
+  ) +
+  stat_compare_means(
+      method = "anova",
+      label.x = 3.8) 
+print(neuron_plot)
+
+ggsave(
+  filename = "../results/figures/cell_type_plots/cell_type_neuron_plot.png",
+  plot = neuron_plot,
+  width = 7,
+  height = 6,
+  units = "in",
+  dpi = 300
+)
+
+for_plot <- props_long %>%
+  filter(CellType == "Astro")
+for_plot$group<- factor(for_plot$group,
+  levels = c("control_no_exercise",
+             "control_exercise",
+             "MPTP_no_exercise",
+             "MPTP_exercise"))
+astro_plot <- ggplot(for_plot, aes(x = group, y = Proportion, fill = group)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(
+    title = "Estimated Astrocyte Proportions between Groups",
+    y = "Estimated Proportion of Astrocytes",
+    x = "Group"
+  ) + 
+  stat_compare_means(
+      method = "anova",
+      label.x = 3.8) 
+print(astro_plot)
+ggsave(
+  filename = "../results/figures/cell_type_plots/cell_type_astrocyte_plot.png",
+  plot = astro_plot,
+  width = 7,
+  height = 6,
+  units = "in",
+  dpi = 300
+)
+```
+
+```{r variance}
+est_props$group <- metadata$group
+est_props %>%
+  group_by(group) %>%
+  summarise(var_astro = var(Astro),
+            var_neuron = var(Neuron))
+# cell type composition is not more variable in MPTP exercise compared to other groups
+```
+
+
+
+
+
+
+
+
+
