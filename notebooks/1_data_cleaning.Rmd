@@ -68,7 +68,7 @@ counts_df <- purrr::reduce(
 )
 counts_df[is.na(counts_df)] <- 0
 
-dir.create("clean_data", showWarnings = FALSE)
+dir.create("../clean_data", showWarnings = FALSE)
 saveRDS(counts_df, "../clean_data/cleaned_counts.RDS")
 ```
 
