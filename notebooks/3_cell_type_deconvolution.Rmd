@@ -227,6 +227,59 @@ est_props %>%
 ```
 
 
+```{r}
+# ---- plotting function ----
+plot_celltype <- function(df, celltype, ylab, title) {
+  df %>%
+    filter(CellType == celltype) %>%
+    ggplot(aes(x = group, y = Proportion, fill = group)) +
+    geom_boxplot(width = 0.6, outlier.shape = NA, alpha = 0.8) +
+    scale_x_discrete(labels = c("control_no_exercise" = "Saline", "control_exercise" = "Saline + Exercise", "MPTP_no_exercise" = "MPTP", "MPTP_exercise" = "MPTP + Exercise")) +
+    geom_jitter(width = 0.15, size = 2, alpha = 0.7) +
+    scale_fill_viridis_d(option = "D", end = 0.9) +
+    labs(
+      title = title,
+      x = NULL,
+      y = ylab
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      axis.text.x = element_text(angle = 20, hjust = 1)
+    ) +
+    stat_compare_means(method = "anova", label.y = max(df$Proportion) * 1.05) +
+    stat_compare_means(method = "t.test",
+                       comparisons = list(
+                         c("Control\nNo Ex", "MPTP\nNo Ex"),
+                         c("Control\nExercise", "MPTP\nExercise")
+                       ),
+                       label = "p.signif")
+}
+
+# ---- generate plots ----
+props_long$group <- factor(props_long$group, levels = c("control_no_exercise","control_exercise", "MPTP_no_exercise","MPTP_exercise"))
+neuron_plot <- plot_celltype(
+  props_long,
+  "Neuron",
+  "Estimated Proportion",
+  "Neuron Proportions Across Groups"
+)
+
+astro_plot <- plot_celltype(
+  props_long,
+  "Astro",
+  "Estimated Proportion",
+  "Astrocyte Proportions Across Groups"
+)
+
+# ---- save ----
+ggsave("../results/figures/cell_type_plots/neuron_plot.png",
+       neuron_plot, width = 6, height = 5)
+
+ggsave("../results/figures/cell_type_plots/astro_plot.png",
+       astro_plot, width = 6, height = 5)
+```
 
 
 

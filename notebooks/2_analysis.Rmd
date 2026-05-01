@@ -121,63 +121,163 @@ ggsave(
 ## Sample-to-Sample Distance Heatmap
 
 ```{r distance-heatmap, message=FALSE}
-sample_dists   <- dist(t(assay(vsd)))
+# Distance matrix
+sample_dists    <- dist(t(assay(vsd)))
 sample_dist_mat <- as.matrix(sample_dists)
-colnames(sample_dist_mat) <- gsub("_", "-", colnames(sample_dist_mat))
-rownames(sample_dist_mat) <- gsub("_", "-", rownames(sample_dist_mat))
 
+# Metadata formatting
 annotation_col <- metadata[, c("lesion", "exercise")]
-rownames(annotation_col) <- metadata$sample
-annotation_col$exercise <- factor(
+
+annotation_col$Exercise <- factor(
   annotation_col$exercise,
   levels = c("no_exercise", "exercise"),
   labels = c("No exercise", "Exercise")
 )
-annotation_col$lesion <- factor(
+
+annotation_col$Lesion <- factor(
   annotation_col$lesion,
   levels = c("control", "MPTP"),
   labels = c("Control", "MPTP")
 )
-colnames(annotation_col) <- c("Lesion", "Exercise")
 
+annotation_col$lesion <- NULL
+annotation_col$exercise <- NULL
+
+rownames(annotation_col) <- metadata$sample
+
+# enforce same order
+annotation_col <- annotation_col[colnames(sample_dist_mat), ]
+
+# build labels
+nice_names <- paste0(annotation_col$Lesion, "\n", annotation_col$Exercise)
+
+# assign directly
+colnames(sample_dist_mat) <- nice_names
+rownames(sample_dist_mat) <- nice_names
+
+# Color scaling (data-driven)
+q <- quantile(sample_dist_mat, probs = c(0.1, 0.5, 0.9))
+
+col_fun <- colorRamp2(
+  c(q[1], q[2], q[3]),
+  c("#2C7BB6", "white", "#D7191C")
+)
+
+# Annotation colors
 annotation_colors <- list(
   Exercise = c("No exercise" = "#E89278", "Exercise" = "#56B4E9"),
   Lesion   = c("Control" = "grey70", "MPTP" = "grey20")
 )
 
-sample_order <- c(
-  "MC1-1","MC1-2","MC1-3","MC1-4",
-  "MC2-1","MC2-2","MC2-3",
-  "MC3-1","MC3-2","MC3-3",
-  "MC4-1","MC4-2"
+# Top annotation
+top_anno <- HeatmapAnnotation(
+  Lesion   = annotation_col$Lesion,
+  Exercise = annotation_col$Exercise,
+  col = annotation_colors,
+  annotation_name_gp = gpar(fontsize = 10, fontface = "bold")
 )
 
+# Heatmap
 dist_heatmap <- Heatmap(
   sample_dist_mat,
-  name                     = "Distance",
-  col                      = colorRamp2(c(0, 75, 150), c("#2C7BB6", "#FFFFBF", "#D7191C")),
-  column_order             = sample_order,
-  row_order                = sample_order,
-  top_annotation           = HeatmapAnnotation(
-    Exercise = annotation_col$Exercise,
-    Lesion   = annotation_col$Lesion,
-    col      = annotation_colors
-  ),
-  show_row_names           = TRUE,
-  show_column_names        = TRUE,
-  column_title             = "Sample-to-sample transcriptomic distances",
-  clustering_method_rows   = "complete",
-  clustering_method_columns = "complete"
+  name = "Distance",
+  col = col_fun,
+  
+  top_annotation = top_anno,
+  
+  show_row_names = FALSE,
+  show_column_names = FALSE,
+
+  clustering_method_rows = "complete",
+  clustering_method_columns = "complete",
+  # row_split = interaction(annotation_col$Lesion, annotation_col$Exercise),
+  # column_split = interaction(annotation_col$Lesion, annotation_col$Exercise),
+  column_split = annotation_col$Lesion,
+  row_split = annotation_col$Lesion,
+  row_gap = unit(2, "mm"),
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  
+  border = TRUE,
+  heatmap_legend_param = list(
+    title_gp = gpar(fontsize = 10, fontface = "bold")
+    #labels_gp = gpar(fontsize = 8)
+  )
 )
 
-png(
-  filename = "../results/figures/sample_distance_heatmap_plot.png",
-  width = 7 * 300, height = 5 * 300, res = 300
+# Save
+png("../results/figures/sample_distance_heatmap_plot.png",
+    width = 7, height = 5, units = "in", res = 300)
+
+draw(
+  dist_heatmap,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right",
+  merge_legends = TRUE
 )
-dist_heatmap
 dev.off()
 
+# Display
 dist_heatmap
+```
+
+```{r}
+# 1. distance matrix (reuse yours if already computed)
+sample_dists <- dist(t(assay(vsd)))
+sample_dist_mat <- as.matrix(sample_dists)
+
+# 2. build clean metadata (DO NOT reuse modified annotation_col)
+meta <- metadata %>%
+  transmute(
+    sample = sample,
+    Lesion = recode(lesion,
+                    control = "Control",
+                    MPTP = "MPTP"),
+    Exercise = recode(exercise,
+                      no_exercise = "No exercise",
+                      exercise = "Exercise"),
+    group = paste(Lesion, Exercise, sep = "_")
+  )
+
+# 3. long-format distance table
+dist_df <- as.data.frame(as.table(sample_dist_mat)) %>%
+  rename(sample1 = Var1, sample2 = Var2, distance = Freq) %>%
+  filter(sample1 != sample2)
+
+# 4. attach group labels
+dist_df <- dist_df %>%
+  left_join(meta, by = c("sample1" = "sample")) %>%
+  rename(group1 = group) %>%
+  left_join(meta, by = c("sample2" = "sample")) %>%
+  rename(group2 = group)
+
+# sanity check (don’t skip)
+stopifnot(!any(is.na(dist_df$group1)))
+stopifnot(!any(is.na(dist_df$group2)))
+
+# 5. remove duplicate pairs (distance matrix is symmetric)
+dist_df <- dist_df %>%
+  rowwise() %>%
+  mutate(pair_id = paste(sort(c(sample1, sample2)), collapse = "_")) %>%
+  ungroup() %>%
+  distinct(pair_id, .keep_all = TRUE)
+
+# 6. define comparison label
+dist_df <- dist_df %>%
+  mutate(comparison = map2_chr(group1, group2,
+                              ~paste(sort(c(.x, .y)), collapse = " vs ")))
+
+# quick check: should be multiple groups
+print(unique(dist_df$comparison))
+
+# 7. plot
+ggplot(dist_df, aes(x = comparison, y = distance)) +
+  geom_violin(fill = "grey85", color = NA) +
+  geom_boxplot(width = 0.15, outlier.shape = NA) +
+  geom_jitter(width = 0.1, alpha = 0.4, size = 1) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = NULL, y = "Sample-to-sample distance")
 ```
 
 ---
@@ -586,7 +686,7 @@ for (g in genes_of_interest) {
 ## Two-Way ANOVA
 
 ```{r two-way-anova}
-interaction_genes <- c("Fosl2", "Nr4a1", "Nr4a3", "Ormdl2", "Egr1")
+interaction_genes <- c("Fosl2", "Nr4a1", "Nr4a3", "Ormdl2", "Egr1", "Htr7", "Prlr", "Arhgef16")
 
 results_list <- lapply(interaction_genes, function(g) {
   df_g  <- plot_df %>% filter(gene_name == g)
@@ -857,8 +957,8 @@ rownames(expr_mat_final) <- levels(factor(sym))
 
 sel_paths <- c(
   "GOMF_TRANSCRIPTION_REGULATOR_ACTIVITY",
-  "GOCC_TRANSCRIPTION_REGULATOR_COMPLEX"
-)
+  "GOCC_TRANSCRIPTION_REGULATOR_COMPLEX",
+  "GOMF_DNA_BINDING_TRANSCRIPTION_ACTIVATOR_ACTIVITY")
 gs_list_sel <- msig[intersect(sel_paths, names(msig))]
 
 gsva_scores <- gsva(
@@ -873,7 +973,8 @@ gsva_scores <- gsva(
 ```{r gsva-plot, fig.width=8, fig.height=5}
 pretty_map <- c(
   "GOCC_TRANSCRIPTION_REGULATOR_COMPLEX"  = "Transcription Regulator\nComplex",
-  "GOMF_TRANSCRIPTION_REGULATOR_ACTIVITY" = "Transcription Regulator\nActivity"
+  "GOMF_TRANSCRIPTION_REGULATOR_ACTIVITY" = "Transcription Regulator\nActivity",
+  "GOMF_DNA_BINDING_TRANSCRIPTION_ACTIVATOR_ACTIVITY" = "DNA Binding Transcription\nActivator Activity"
 )
 
 gsva_plot_df <- as.data.frame(t(gsva_scores)) %>%
@@ -898,17 +999,41 @@ comparisons <- list(
   c("MPTP",   "MPTP + Exercise")
 )
 
+pvals <- compare_means(
+  score ~ condition,
+  data = gsva_plot_df,
+  group.by = "pathway_label",
+  method = "t.test",
+  p.adjust.method = "BH"   # or "bonferroni", "holm", etc.
+)
+
+pvals <- pvals %>%
+  left_join(
+    gsva_plot_df %>%
+      group_by(pathway_label) %>%
+      summarise(y.position = max(score, na.rm = TRUE) * 1.1),
+    by = "pathway_label"
+  )
+pvals <- pvals %>%
+  dplyr::filter(
+    (group1 == "Saline" & group2 == "Saline + Exercise") |
+    (group1 == "MPTP" & group2 == "MPTP + Exercise") |
+    (group1 == "Saline" & group2 == "MPTP + Exercise")
+
+  )
+
 p_gsva <- ggplot(gsva_plot_df, aes(x = condition, y = score)) +
   geom_boxplot(outlier.shape = NA, width = 0.6, alpha = 0.9) +
   geom_jitter(width = 0.08, size = 2, color = "black") +
   facet_wrap(~ pathway_label, scales = "free_y") +
-  stat_compare_means(
-    comparisons = comparisons,
-    method      = "t.test",
-    label       = "p.signif",
-    hide.ns     = TRUE,
-    tip.length  = 0.02
-  ) +
+  # stat_compare_means(
+  #   comparisons = comparisons,
+  #   method      = "t.test",
+  #   label       = "p.signif",
+  #   hide.ns     = TRUE,
+  #   tip.length  = 0.02
+  # ) +
+  stat_pvalue_manual(pvals, label = "p.signif")+
   theme_classic(base_size = 15) +
   theme(
     strip.text   = element_text(face = "bold"),
@@ -921,7 +1046,7 @@ p_gsva
 
 ggsave(
   filename = "../results/figures/gsva_transcription_boxplot.png",
-  plot     = p_gsva, width = 8, height = 5, dpi = 300
+  plot     = p_gsva, width = 12, height = 5, dpi = 300
 )
 ```
 ## Interaction Panel Plot (Poster)
@@ -1005,7 +1130,7 @@ combined
 
 ggsave(
   filename = "../results/figures/poster_panel_boxplot.png",
-  plot = combined, width = 9, height = 10, units = "in", dpi = 300
+  plot = combined, width = 15, height = 15, units = "in", dpi = 300
 )
 ```
 
